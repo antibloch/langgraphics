@@ -238,6 +238,7 @@ def test_error_agent_edge_count():
     assert len(topo["edges"]) == 11
 
 
+_NOTIFIER = "_ParentNotifierMiddleware.after_agent"
 _DEEP_NODES = {
     "__start__", "model", "tools",
     "PatchToolCallsMiddleware.before_agent",
@@ -245,11 +246,18 @@ _DEEP_NODES = {
 }
 
 
+def _deep_expected(topo):
+    """Newer deepagents releases add a parent notifier node before __end__."""
+    has_notifier = any(n["name"] == _NOTIFIER for n in topo["nodes"])
+    nodes = _DEEP_NODES | {_NOTIFIER} if has_notifier else _DEEP_NODES
+    return nodes, has_notifier
+
+
 @requires_deepagents
 def test_deep_agent_node_names():
     topo = extract(deep_agent.graph)
     assert topo["type"] == "graph"
-    assert {n["name"] for n in topo["nodes"]} == _DEEP_NODES
+    assert {n["name"] for n in topo["nodes"]} == _deep_expected(topo)[0]
 
 
 @requires_deepagents
@@ -258,7 +266,7 @@ def test_deep_agent_node_types():
     types = {n["name"]: n["node_type"] for n in topo["nodes"]}
     assert types["__start__"] == "start"
     assert types["__end__"] == "end"
-    for node in _DEEP_NODES - {"__start__", "__end__"}:
+    for node in _deep_expected(topo)[0] - {"__start__", "__end__"}:
         assert types[node] == "node"
 
 
@@ -276,13 +284,14 @@ def test_deep_agent_model_has_conditional_edges():
     outgoing = [e for e in topo["edges"] if e["source"] == "model"]
     assert len(outgoing) == 3
     assert all(e["conditional"] for e in outgoing)
-    assert {e["target"] for e in outgoing} == {"tools", "model", "__end__"}
+    final = _NOTIFIER if _deep_expected(topo)[1] else "__end__"
+    assert {e["target"] for e in outgoing} == {"tools", "model", final}
 
 
 @requires_deepagents
 def test_deep_agent_edge_count():
     topo = extract(deep_agent.graph)
-    assert len(topo["edges"]) == 6
+    assert len(topo["edges"]) == (7 if _deep_expected(topo)[1] else 6)
 
 
 @requires_deepagents
@@ -342,7 +351,7 @@ def test_sub1_agent_deep_subgraph_structure():
 @requires_deepagents
 def test_sub1_agent_edge_count():
     topo = extract(sub1_agent.graph)
-    assert len(topo["edges"]) == 6
+    assert len(topo["edges"]) == (7 if _deep_expected(topo)[1] else 6)
 
 
 def test_sub2_agent_top_level_node_names():
