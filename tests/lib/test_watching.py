@@ -136,6 +136,8 @@ async def test_basic_agent_edge_sequence():
         ("__start__", "summariser_runner"),
         ("summariser_runner", "responder"),
         ("responder", "tools"),
+        ("tools:__start__", "tools:tool:knowledge_base"),
+        ("tools:tool:knowledge_base", "tools:__end__"),
         ("tools", "responder"),
         ("responder", "__end__"),
     ]
@@ -152,7 +154,14 @@ async def test_basic_agent_edge_ids_match_topology():
             viewport, {"messages": [HumanMessage(content="What is the meaning of life?")]}
         )
 
-    valid_ids = {e["id"] for e in messages[0]["edges"]}
+    def valid_edges(topology, prefix=""):
+        ids = {f"{prefix}:{edge['id']}" if prefix else edge["id"] for edge in topology["edges"]}
+        for node in topology["nodes"]:
+            if node.get("subgraph"):
+                child = f"{prefix}:{node['id']}" if prefix else node["id"]
+                ids.update(valid_edges(node["subgraph"], child))
+        return ids
+    valid_ids = valid_edges(messages[0])
     for event in (m for m in messages if m["type"] == "edge_active"):
         assert event["edge_id"] in valid_ids
 

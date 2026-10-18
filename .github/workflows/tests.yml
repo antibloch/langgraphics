@@ -14,35 +14,15 @@ jobs:
       matrix:
         include:
           - python: "3.10"
-            env: py310-lg100
-          - python: "3.10"
-            env: py310-lg105
-          - python: "3.10"
-            env: py310-lg108
+            env: py310-lg12
           - python: "3.11"
-            env: py311-lg100
-          - python: "3.11"
-            env: py311-lg105
-          - python: "3.11"
-            env: py311-lg108
+            env: py311-lg12
           - python: "3.12"
-            env: py312-lg100
-          - python: "3.12"
-            env: py312-lg105
-          - python: "3.12"
-            env: py312-lg108
+            env: py312-lg12
           - python: "3.13"
-            env: py313-lg100
-          - python: "3.13"
-            env: py313-lg105
-          - python: "3.13"
-            env: py313-lg108
+            env: py313-lg12
           - python: "3.14"
-            env: py314-lg100
-          - python: "3.14"
-            env: py314-lg105
-          - python: "3.14"
-            env: py314-lg108
+            env: py314-lg12
 
     steps:
       - uses: actions/checkout@v4
@@ -76,8 +56,12 @@ jobs:
 
       - name: Install dependencies
         working-directory: langgraphics-web
-        run: npm install
+        run: npm ci
 
       - name: Run tests
         working-directory: langgraphics-web
         run: npm test
+
+      - name: Build frontend
+        working-directory: langgraphics-web
+        run: npm run build

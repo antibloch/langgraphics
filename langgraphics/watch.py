@@ -10,6 +10,7 @@ from websockets.asyncio.server import serve
 
 from .broadcaster import Broadcaster
 from .streamer import Viewport
+from .runtime import validate_supported
 from .topology import extract
 from .upstream import sync
 
@@ -21,7 +22,11 @@ DEFAULT_WS_PORT = 8765
 def start_http_server(host: str, port: int) -> TCPServer:
     static = Path(__file__).parent / "static"
     handler = partial(SimpleHTTPRequestHandler, directory=static)
-    server = TCPServer((host, port), handler)
+
+    class ReusableTCPServer(TCPServer):
+        allow_reuse_address = True
+
+    server = ReusableTCPServer((host, port), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
@@ -52,6 +57,7 @@ def watch(
     inspect: Literal["off", "tree", "full"] = "off",
     theme: Literal["system", "dark", "light"] = "system",
 ) -> ANY_GRAPH:
+    validate_supported(graph)
     sync()
     topology = extract(graph)
     manager = Broadcaster(topology)
@@ -61,7 +67,9 @@ def watch(
             if node.get("node_type") == "subgraph" and node.get("subgraph"):
                 pid = f"{prefix}:{node['id']}" if prefix else node["id"]
                 for e in node["subgraph"]["edges"]:
-                    edge_lookup[(f"{pid}:{e['source']}", f"{pid}:{e['target']}")] = f"{pid}:{e['id']}"
+                    edge_lookup[(f"{pid}:{e['source']}", f"{pid}:{e['target']}")] = (
+                        f"{pid}:{e['id']}"
+                    )
                 collect_subgraph_edges(node["subgraph"]["nodes"], pid)
 
     edge_lookup = {(e["source"], e["target"]): e["id"] for e in topology["edges"]}

@@ -1,327 +1,617 @@
 import asyncio
 import json
+import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
-from socketserver import TCPServer
-from typing import Any
+from pathlib import Path
 
 from langchain_core.tracers.base import AsyncBaseTracer
-from langchain_core.tracers.schemas import Run
+from langgraph.errors import GraphBubbleUp, GraphInterrupt
 
-from .formatter import Formatter
+from .runtime import observe_graph, prompt_text
+
+
+def json_text(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        default=lambda obj: (
+            obj.model_dump() if hasattr(obj, "model_dump") else str(obj)
+        ),
+    )
+
+
+def short_output(output):
+    if isinstance(output, (str, int, float, bool)):
+        return str(output)
+    if isinstance(output, dict):
+        if isinstance(output.get("activity"), str):
+            return output["activity"]
+        for key in ("answer", "response", "result"):
+            if isinstance(output.get(key), (str, int, float)):
+                return str(output[key])
+        messages = output.get("messages", [])
+        if messages:
+            last = messages[-1]
+            calls = getattr(last, "tool_calls", None)
+            if calls:
+                return "Tool calls: " + "; ".join(
+                    f"{c['name']}({json_text(c.get('args', {}))})" for c in calls
+                )
+            content = getattr(last, "content", "")
+            if isinstance(content, str):
+                return content
+    return ""
 
 
 class BroadcastingTracer(AsyncBaseTracer):
-    def __init__(self, viewport: "Viewport") -> None:
+    """Native tool-call lifecycle, correlated to the containing runtime task."""
+
+    def __init__(self, viewport):
         super().__init__(_schema_format="original+chat")
         self.viewport = viewport
-        self.states = {}
+        self.tools = {}
+        self.raw_tool_inputs = {}
 
-    def _build_full_id(self, run: Run) -> str | None:
-        parts = [run.name]
-        current = run
-        top_container = None
-        while current.parent_run_id:
-            parent = self.run_map.get(str(current.parent_run_id))
-            if parent is None:
-                break
-            if parent.name == "LangGraph":
-                current = parent
-                continue
-            if parent.name in self.viewport.node_names:
-                top_container = parent.name
-                break
-            parts.append(parent.name)
-            current = parent
-        if top_container is None:
-            return None
-        parts.reverse()
-        full_id = f"{top_container}:{':'.join(parts)}"
-        if full_id in self.viewport.predecessors:
-            return full_id
-
-    async def _persist_run(self, run: Run) -> None:
+    async def _persist_run(self, run):
         pass
 
-    async def _emit_end(self, run: Run) -> None:
-        node_run_id = str(run.parent_run_id) if run.parent_run_id else None
-        if node_run_id is None:
+    async def _on_chain_end(self, run):
+        if self.viewport.event_run_id and run.parent_run_id is None:
+            self.viewport._finish(self.viewport.event_run_id, run.outputs)
+            self.viewport.event_run_id = None
+            self.viewport.busy = False
+
+    async def _on_chain_error(self, run):
+        if self.viewport.event_run_id and run.parent_run_id is None:
+            self.viewport._failure(RuntimeError(str(run.error)))
+            self.viewport.event_run_id = None
+            self.viewport.busy = False
+
+    def _owner(self, run):
+        current = run
+        while current:
+            metadata = (current.extra or {}).get("metadata", {})
+            ns = metadata.get("langgraph_checkpoint_ns")
+            if ns:
+                names = [part.rsplit(":", 1)[0] for part in ns.split("|")]
+                return ":".join(names)
+            current = (
+                self.run_map.get(str(current.parent_run_id))
+                if current.parent_run_id
+                else None
+            )
+        return None
+
+    async def on_tool_start(
+        self, serialized, input_str, *, run_id, inputs=None, **kwargs
+    ):
+        # LangChain may filter invalid arguments out of `inputs` before tool
+        # validation. Preserve the actual call string as well, including errors.
+        self.raw_tool_inputs[str(run_id)] = inputs if inputs else input_str
+        await super().on_tool_start(
+            serialized, input_str, run_id=run_id, inputs=inputs, **kwargs
+        )
+
+    async def _on_tool_start(self, run):
+        owner = self._owner(run)
+        node_id = f"{owner}:tool:{run.name}"
+        if node_id not in self.viewport.node_ids:
             return
-        state = self.states.get(run.name)
-        await self.viewport.broadcast(
+        invocation = str(run.id)
+        self.tools[invocation] = (owner, node_id)
+        metadata = (run.extra or {}).get("metadata", {})
+        actual_input = self.raw_tool_inputs.get(invocation, run.inputs)
+        self.viewport.publish(
             {
-                "type": "node_output",
-                "run_id": str(run.id),
-                "parent_run_id": node_run_id,
-                "node_id": run.name,
-                "node_kind": run.run_type,
-                "status": "error" if run.error else "ok",
-                "input": Formatter.inputs(run),
-                "output": Formatter.outputs(run),
-                "metrics": Formatter.metrics(run),
-                "state": json.dumps(
-                    state,
-                    ensure_ascii=False,
-                    default=lambda x: x.__dict__,
-                ) if state else None,
+                "type": "edge_active",
+                "source": f"{owner}:__start__",
+                "target": node_id,
+                "edge_id": self.viewport.edge_id(f"{owner}:__start__", node_id),
+                "invocation_id": invocation,
+                "tool_call_id": metadata.get("tool_call_id"),
+                "payload": json_text(actual_input),
+                "kind": "tool_call",
+            }
+        )
+        self.viewport.publish(
+            {
+                "type": "node_start",
+                "node": node_id,
+                "task_id": invocation,
+                "summary": f"{run.name}({json_text(actual_input)})",
+                "input_kind": "tool_arguments",
             }
         )
 
-    async def _on_chain_start(self, run: Run) -> None:
-        self.states[run.name] = run.inputs
-        if run.name in self.viewport.node_names:
-            self.viewport.node_current = run.name
-            await self.viewport._emit_edge(run.name)
-        else:
-            if (full_id := self._build_full_id(run)) is not None:
-                await self.viewport._emit_edge(full_id)
+    async def _on_tool_end(self, run):
+        self._tool_done(run)
 
-    async def _on_chain_end(self, run: Run) -> None:
-        async def emit_last_edge(run_name):
-            end_id = f"{run_name}:__end__"
-            if end_id in self.viewport.predecessors:
-                await self.viewport._emit_edge(end_id)
+    async def _on_tool_error(self, run):
+        self._tool_done(run)
 
-        if run.name in self.viewport.node_names:
-            parent = (
-                self.run_map.get(str(run.parent_run_id)) if run.parent_run_id else None
+    def _tool_done(self, run):
+        identity = self.tools.pop(str(run.id), None)
+        if identity is None:
+            return
+        owner, node_id = identity
+        output = (run.outputs or {}).get("output", run.outputs)
+        content = getattr(output, "content", output)
+        text = (
+            str(run.error)
+            if run.error
+            else (content if isinstance(content, str) else json_text(content))
+        )
+        actual_input = self.raw_tool_inputs.pop(str(run.id), run.inputs)
+        self.viewport.publish(
+            {
+                "type": "node_output",
+                "node_id": node_id,
+                "run_id": str(run.id),
+                "status": "error" if run.error else "ok",
+                "summary": text,
+                "input": json_text(actual_input),
+                "output": text,
+                "node_kind": "tool",
+            }
+        )
+        if not run.error:
+            self.viewport.publish(
+                {
+                    "type": "edge_active",
+                    "source": node_id,
+                    "target": f"{owner}:__end__",
+                    "edge_id": self.viewport.edge_id(node_id, f"{owner}:__end__"),
+                    "invocation_id": str(run.id),
+                    "payload": text,
+                    "kind": "observation",
+                }
             )
-            if parent is None or parent.name not in self.viewport.node_names:
-                self.viewport.completed_nodes.add(run.name)
-                state = self.states.get(run.name)
-                await self.viewport.broadcast(
-                    {
-                        "type": "node_output",
-                        "node_id": run.name,
-                        "run_id": str(run.id),
-                        "node_kind": run.run_type,
-                        "status": "error" if run.error else "ok",
-                        "input": Formatter.inputs(run),
-                        "output": Formatter.outputs(run),
-                        "metrics": Formatter.metrics(run),
-                        "state": json.dumps(
-                            state,
-                            ensure_ascii=False,
-                            default=lambda x: x.__dict__,
-                        ) if state else None,
-                    }
-                )
-                await emit_last_edge(run.name)
-        else:
-            if (full_id := self._build_full_id(run)) is not None:
-                await emit_last_edge(full_id)
-            await self._emit_end(run)
-
-    async def _on_chain_error(self, run: Run) -> None:
-        if run.name in self.viewport.node_names:
-            parent = self.run_map.get(str(run.parent_run_id)) if run.parent_run_id else None
-            if parent is None or parent.name not in self.viewport.node_names:
-                await self.viewport.broadcast(
-                    {
-                        "type": "node_output",
-                        "node_id": run.name,
-                        "run_id": str(run.id),
-                        "node_kind": run.run_type,
-                        "status": "error" if run.error else "ok",
-                        "input": Formatter.inputs(run),
-                        "output": Formatter.outputs(run),
-                        "metrics": Formatter.metrics(run),
-                        "state": json.dumps(
-                            self.states.get(run.name),
-                            ensure_ascii=False,
-                            default=lambda x: x.__dict__,
-                        ) if self.states.get(run.name) else None,
-                    }
-                )
-        else:
-            await self._emit_end(run)
-
-    async def _on_llm_end(self, run: Run) -> None:
-        await self._emit_end(run)
-
-    async def _on_llm_error(self, run: Run) -> None:
-        await self._emit_end(run)
-
-    async def _on_tool_end(self, run: Run) -> None:
-        await self._emit_end(run)
-
-    async def _on_tool_error(self, run: Run) -> None:
-        await self._emit_end(run)
-
-    async def _on_retriever_end(self, run: Run) -> None:
-        await self._emit_end(run)
-
-    async def _on_retriever_error(self, run: Run) -> None:
-        await self._emit_end(run)
 
 
 class Viewport:
-    def __init__(
-        self,
-        graph: Any,
-        ws: Any,
-        edge_lookup: dict[tuple[str, str], str],
-        http_server: TCPServer,
-    ) -> None:
-        self.ws = ws
-        self.graph = graph
-        self.node_current = None
-        self.edge_lookup = edge_lookup
-        self.http_server = http_server
-        self.predecessors: dict[str, set[str]] = {}
-        for src, tgt in edge_lookup:
-            self.predecessors.setdefault(tgt, set()).add(src)
-        self.generation: dict[str, int] = {
-            n: 0 for pair in edge_lookup for n in pair
-            if n == "__start__" or n.endswith(":__start__")
-        }
-        self.node_names: set[str] = {
-            n for pair in edge_lookup for n in pair
-            if ":" not in n and n not in {"__start__", "__end__"}
-        }
-        self.completed_nodes: set[str] = set()
-        self.linked: set[tuple[str, int, str]] = set()
+    def __init__(self, graph, ws, edge_lookup, http_server):
+        self.ws, self.graph, self.edge_lookup, self.http_server = (
+            ws,
+            graph,
+            edge_lookup,
+            http_server,
+        )
+        self.lock = threading.RLock()
+        self.started_at, self.sequence = time.monotonic(), 0
+        self.active = {}
+        self.contexts = {}
+        self.arrivals = {}
+        self.last_inputs = {}
+        self.terminal_sources = set()
+        self.node_ids = set()
+        self.dynamic_edges = []
+        self.busy = False
+        self.event_run_id = None
+        self.last_failure = None
+        self.interrupted = False
+        self.run_ended = False
+        self.last_root_result = None
+        self.current_prompt = ""
 
-    def __getattr__(self, name: str) -> Any:
+        def collect(topology, prefix=""):
+            for node in topology["nodes"]:
+                node_id = f"{prefix}:{node['id']}" if prefix else node["id"]
+                self.node_ids.add(node_id)
+                if node.get("subgraph"):
+                    collect(node["subgraph"], node_id)
+            for edge in topology["edges"]:
+                if edge["target"] == "__end__":
+                    source = f"{prefix}:{edge['source']}" if prefix else edge["source"]
+                    self.terminal_sources.add(source)
+
+        collect(json.loads(ws.topology_json))
+        self.observed = observe_graph(graph, self)
+
+    def __getattr__(self, name):
+        if name in {
+            "batch",
+            "abatch",
+            "batch_as_completed",
+            "abatch_as_completed",
+            "with_config",
+            "with_retry",
+            "with_fallbacks",
+            "astream_log",
+        }:
+            raise NotImplementedError(
+                f"Apply {name} to the compiled graph before watch(); this viewport supports one traced run at a time"
+            )
         return getattr(self.graph, name)
 
-    async def broadcast(self, message: dict[str, Any]) -> None:
-        message_str = json.dumps(message)
-        self.ws.record(message_str)
-        if self.ws.loop is None:
-            return
-        try:
-            await asyncio.wrap_future(
+    def publish(self, message):
+        with self.lock:
+            self.sequence += 1
+            message = {
+                **message,
+                "seq": self.sequence,
+                "elapsed_ms": round((time.monotonic() - self.started_at) * 1000, 3),
+            }
+            encoded = json_text(message)
+            self.ws.record(encoded)
+            if self.ws.loop is not None:
                 asyncio.run_coroutine_threadsafe(
-                    self.ws.broadcast(message_str), self.ws.loop
+                    self.ws.broadcast(encoded), self.ws.loop
                 )
+
+    async def broadcast(self, message):
+        self.publish(message)
+        await asyncio.sleep(0)
+
+    def edge_id(self, source, target):
+        with self.lock:
+            key = (source, target)
+            if key not in self.edge_lookup:
+                edge = {
+                    "id": f"runtime-{uuid.uuid4().hex[:12]}",
+                    "source": source,
+                    "target": target,
+                    "conditional": True,
+                    "label": "Runtime route",
+                }
+                self.edge_lookup[key] = edge["id"]
+                self.dynamic_edges.append(edge)
+                self.publish({"type": "graph_edge", **edge})
+            return self.edge_lookup[key]
+
+    def task_start(self, name, prefix, input, config):
+        metadata = config.get("metadata", {})
+        task_id = config["configurable"]["__pregel_task_id"]
+        node_id = f"{prefix}:{name}" if prefix else name
+        context = {
+            "node": node_id,
+            "task_id": task_id,
+            "prefix": prefix,
+            "namespace": metadata.get("langgraph_checkpoint_ns", ""),
+            "step": metadata.get("langgraph_step"),
+            "start": time.monotonic(),
+        }
+        with self.lock:
+            self.last_inputs[task_id] = input
+            self.active[task_id] = context
+            self.contexts[task_id] = context
+        if name != "__start__":
+            self.publish(
+                {
+                    "type": "node_start",
+                    "node": node_id,
+                    "task_id": task_id,
+                    "namespace": context["namespace"],
+                    "step": context["step"],
+                    "input": json_text(input),
+                    "input_kind": "prompt_context"
+                    if self.current_prompt and prompt_text(input) == self.current_prompt
+                    else "state",
+                }
             )
-        except Exception:
-            pass
+        return context
 
-    async def _emit_edge(self, target: str) -> None:
-        for source in self.predecessors.get(target, set()):
-            if (src_gen := self.generation.get(source)) is None:
+    def task_end(self, context, input, result, writes, triggers):
+        source, prefix = context["node"], context["prefix"]
+        is_start = source.rsplit(":", 1)[-1] == "__start__"
+        if not prefix and not is_start:
+            self.last_root_result = result
+        with self.lock:
+            self.active.pop(context["task_id"], None)
+        if not is_start:
+            self.publish(
+                {
+                    "type": "node_output",
+                    "node_id": source,
+                    "run_id": context["task_id"],
+                    "status": "ok",
+                    "summary": short_output(result),
+                    "input": json_text(input),
+                    "output": json_text(result),
+                    "node_kind": "chain",
+                    "duration_ms": round(
+                        (time.monotonic() - context["start"]) * 1000, 3
+                    ),
+                }
+            )
+        self.task_routes(context, input, result, writes, triggers)
+
+    def task_routes(self, context, input, result, writes, triggers, terminate=True):
+        source, prefix = context["node"], context["prefix"]
+        is_start = source.rsplit(":", 1)[-1] == "__start__"
+        destinations = []
+        for channel, value in writes:
+            # These are actual scheduler writes, not guesses from graph edges.
+            if channel == "__pregel_tasks" and hasattr(value, "node"):
+                destinations.append((value.node, "send", value.arg))
+            else:
+                for target, channels in triggers.items():
+                    if channel in channels and target != "__start__":
+                        destinations.append(
+                            (
+                                target,
+                                "join" if channel.startswith("join:") else "state",
+                                result,
+                            )
+                        )
+        seen = context.setdefault("routes_seen", set())
+        for target, kind, payload in destinations:
+            # Ordinary repeated channel writes coalesce into one scheduled task;
+            # Send packets remain distinct even when their destinations coincide.
+            if kind != "send" and target in seen:
                 continue
-            if (key := (source, src_gen, target)) in self.linked:
-                continue
-            self.linked.add(key)
-            if edge_id := self.edge_lookup.get((source, target)):
-                await self.broadcast(
-                    {
-                        "type": "edge_active",
-                        "source": source,
-                        "target": target,
-                        "edge_id": edge_id,
-                    }
-                )
-        self.generation[target] = self.generation.get(target, -1) + 1
+            seen.add(target)
+            target_id = f"{prefix}:{target}" if prefix else target
+            self.arrivals[target_id] = source
+            self.publish(
+                {
+                    "type": "edge_active",
+                    "source": source,
+                    "target": target_id,
+                    "edge_id": self.edge_id(source, target_id),
+                    "kind": kind,
+                    "source_task_id": context["task_id"],
+                    "namespace": context["namespace"],
+                    "payload": json_text(input if is_start else payload),
+                }
+            )
+        # LangGraph 1.2 drops END writes. A successful task without any
+        # outgoing scheduling writes terminates its branch; this is marked
+        # separately from an observed routing write, never inferred as a call.
+        if terminate and not destinations and not is_start:
+            target = f"{prefix}:__end__" if prefix else "__end__"
+            self.publish(
+                {
+                    "type": "edge_active",
+                    "source": source,
+                    "target": target,
+                    "edge_id": self.edge_id(source, target),
+                    "kind": "termination",
+                    "source_task_id": context["task_id"],
+                    "payload": json_text(result),
+                }
+            )
 
-    async def _emit_error(self, last_node: str) -> None:
-        for target in {tgt for src, gen, tgt in self.linked if all([
-            tgt in self.node_names, tgt not in self.completed_nodes,
-        ])}:
-            for source in self.predecessors.get(target, set()):
-                if any(k[0] == source and k[2] == target for k in self.linked):
-                    if eid := self.edge_lookup.get((source, target)):
-                        await self.broadcast({
-                            "type": "error",
-                            "edge_id": eid,
-                            "source": source,
-                            "target": target,
-                        })
-                        return
-        for (src, tgt), eid in self.edge_lookup.items():
-            if src == last_node:
-                await self.broadcast({
-                    "type": "error",
-                    "edge_id": eid,
-                    "source": last_node,
-                    "target": tgt,
-                })
-                break
+    def task_error(self, context, error):
+        with self.lock:
+            self.active.pop(context["task_id"], None)
+        if isinstance(error, GraphInterrupt):
+            self.interrupted = True
+            self.publish(
+                {
+                    "type": "run_interrupt",
+                    "node": context["node"],
+                    "task_id": context["task_id"],
+                }
+            )
+            return
+        if isinstance(error, GraphBubbleUp):
+            self.publish(
+                {
+                    "type": "node_output",
+                    "node_id": context["node"],
+                    "run_id": context["task_id"],
+                    "status": "ok",
+                    "summary": "Returned control to the parent graph",
+                }
+            )
+            return
+        if isinstance(
+            error, (asyncio.CancelledError, KeyboardInterrupt, GeneratorExit)
+        ):
+            return
+        target = context["node"]
+        source = self.arrivals.get(target)
+        self.publish(
+            {
+                "type": "node_output",
+                "node_id": target,
+                "run_id": context["task_id"],
+                "status": "error",
+                "summary": str(error),
+            }
+        )
+        self.last_failure = (source or target, target, str(error))
+        self.publish(
+            {
+                "type": "task_attempt_error",
+                "node": target,
+                "task_id": context["task_id"],
+                "message": str(error),
+            }
+        )
 
-    def _make_config(self, config: Any) -> dict[str, Any]:
+    def _failure(self, error):
+        self.run_ended = True
+        source, target, message = self.last_failure or (
+            "__start__",
+            "__start__",
+            str(error),
+        )
+        self.publish(
+            {
+                "type": "error",
+                "source": source,
+                "target": target,
+                "edge_id": self.edge_lookup.get((source, target)),
+                "message": message,
+            }
+        )
+
+    def _finish(self, run_id, result=None):
+        self.run_ended = True
+        if result is None:
+            result = self.last_root_result
+        self.publish(
+            {
+                "type": "run_end",
+                "run_id": run_id,
+                "status": "interrupted" if self.interrupted else "complete",
+                "output_summary": short_output(result),
+            }
+        )
+
+    def _start(self, input):
+        if self.busy:
+            raise RuntimeError("One run at a time per Langgraphics viewport")
+        self.busy = True
+        self.last_failure = None
+        self.interrupted = False
+        self.run_ended = False
+        self.last_root_result = None
+        self.started_at, self.sequence = time.monotonic(), 0
+        self.active.clear()
+        self.contexts.clear()
+        self.arrivals.clear()
+        self.last_inputs.clear()
+        run_id = uuid.uuid4().hex[:8]
+        self.current_prompt = prompt_text(input)
+        self.publish(
+            {
+                "type": "run_start",
+                "run_id": run_id,
+                "prompt": prompt_text(input),
+                "input": json_text(input),
+                "trace_source": "langgraph_scheduler_writes",
+            }
+        )
+        for edge in self.dynamic_edges:
+            self.publish({"type": "graph_edge", **edge})
+        return run_id
+
+    def _config(self, config):
+        merged = dict(config or {})
+        callbacks = merged.get("callbacks")
         tracer = BroadcastingTracer(self)
-        merged: dict[str, Any] = dict(config or {})
-        merged["callbacks"] = list(merged.get("callbacks") or []) + [tracer]
+        if callbacks is None:
+            merged["callbacks"] = [tracer]
+        elif isinstance(callbacks, (list, tuple)):
+            merged["callbacks"] = [*callbacks, tracer]
+        else:
+            manager = callbacks.copy()
+            manager.add_handler(tracer)
+            merged["callbacks"] = manager
         return merged
 
-    async def shutdown(self) -> None:
+    async def shutdown(self):
         await self.ws.shutdown()
-        self.http_server.shutdown()
+        await asyncio.to_thread(self.http_server.shutdown)
+        self.http_server.server_close()
 
-    async def ainvoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
-        run_id = uuid.uuid4().hex[:8]
-        await self.broadcast({"type": "run_start", "run_id": run_id})
+    def export_trace(self, path):
+        """Save actual recorded events, never re-execute the graph to export."""
+        with self.lock:
+            trace = {
+                "format": "langgraphics.trace.v1",
+                "graph": json.loads(self.ws.topology_json),
+                "events": [json.loads(raw) for raw in self.ws.replay],
+            }
+            Path(path).write_text(json_text(trace))
 
-        result: Any = None
-        last_node = "__start__"
-        merged_config = self._make_config(config)
-        kwargs.pop("subgraphs", None)
-
+    def stream_events(self, input, config=None, **kwargs):
+        self.event_run_id = self._start(input)
         try:
-            async for namespace, chunk in self.graph.astream(
-                input, config=merged_config, stream_mode="updates", subgraphs=True, **kwargs
-            ):
-                if isinstance(chunk, dict) and not namespace:
-                    for node_name, node_result in chunk.items():
-                        if node_name == "__metadata__":
-                            continue
-                        last_node = node_name
-                        result = node_result
-
-            await self._emit_edge("__end__")
-            await self.broadcast({"type": "run_end", "run_id": run_id})
-        except Exception:
-            await self._emit_error(last_node)
-            raise
-        finally:
-            await self.shutdown()
-
-        return result
-
-    def invoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
-        return asyncio.run(self.ainvoke(input, config=config, **kwargs))
-
-    async def astream(
-        self, input: Any, config: Any = None, **kwargs: Any
-    ) -> AsyncIterator:
-        run_id = uuid.uuid4().hex[:8]
-        await self.broadcast({"type": "run_start", "run_id": run_id})
-
-        last_node = "__start__"
-        merged_config = self._make_config(config)
-        stream_mode = kwargs.get("stream_mode", "values")
-        kwargs.pop("subgraphs", None)
-
-        try:
-            async for namespace, chunk in self.graph.astream(
-                input, config=merged_config, subgraphs=True, **kwargs
-            ):
-                if isinstance(chunk, dict) and stream_mode == "updates" and not namespace:
-                    for node_name in chunk:
-                        if node_name == "__metadata__":
-                            continue
-                        last_node = node_name
-                if not namespace:
-                    yield chunk
-
-            await self._emit_edge("__end__")
-
-            await self.broadcast({"type": "run_end", "run_id": run_id})
-        except Exception:
-            await self._emit_error(last_node)
+            return self.observed.stream_events(input, self._config(config), **kwargs)
+        except Exception as error:
+            self._failure(error)
+            self.event_run_id = None
+            self.busy = False
             raise
 
-    def stream(self, input: Any, config: Any = None, **kwargs: Any) -> Iterator:
-        loop = asyncio.new_event_loop()
-        ait = self.astream(input, config=config, **kwargs).__aiter__()
-        try:
-            while True:
+    def astream_events(self, input, config=None, **kwargs):
+        self.event_run_id = self._start(input)
+        if kwargs.get("version") == "v3":
+
+            async def create():
                 try:
-                    yield loop.run_until_complete(ait.__anext__())
-                except StopAsyncIteration:
-                    break
+                    return await self.observed.astream_events(
+                        input, self._config(config), **kwargs
+                    )
+                except Exception as error:
+                    self._failure(error)
+                    self.event_run_id = None
+                    self.busy = False
+                    raise
+
+            return create()
+
+        async def iterate():
+            try:
+                async for event in self.observed.astream_events(
+                    input, self._config(config), **kwargs
+                ):
+                    yield event
+            except Exception as error:
+                self._failure(error)
+                raise
+            finally:
+                self.event_run_id = None
+                self.busy = False
+
+        return iterate()
+
+    async def ainvoke(self, input, config=None, **kwargs):
+        run_id = self._start(input)
+        try:
+            result = await self.observed.ainvoke(input, self._config(config), **kwargs)
+            self._finish(run_id, result)
+            return result
+        except Exception as error:
+            self._failure(error)
+            raise
         finally:
-            loop.close()
+            if not self.run_ended:
+                self.publish(
+                    {"type": "run_end", "run_id": run_id, "status": "cancelled"}
+                )
+            self.busy = False
+
+    def invoke(self, input, config=None, **kwargs):
+        run_id = self._start(input)
+        try:
+            result = self.observed.invoke(input, self._config(config), **kwargs)
+            self._finish(run_id, result)
+            return result
+        except Exception as error:
+            self._failure(error)
+            raise
+        finally:
+            if not self.run_ended:
+                self.publish(
+                    {"type": "run_end", "run_id": run_id, "status": "cancelled"}
+                )
+            self.busy = False
+
+    async def astream(self, input, config=None, **kwargs) -> AsyncIterator:
+        run_id = self._start(input)
+        try:
+            async for chunk in self.observed.astream(
+                input, self._config(config), **kwargs
+            ):
+                yield chunk
+            self._finish(run_id)
+        except Exception as error:
+            self._failure(error)
+            raise
+        finally:
+            if not self.run_ended:
+                self.publish(
+                    {"type": "run_end", "run_id": run_id, "status": "cancelled"}
+                )
+            self.busy = False
+
+    def stream(self, input, config=None, **kwargs) -> Iterator:
+        run_id = self._start(input)
+        try:
+            yield from self.observed.stream(input, self._config(config), **kwargs)
+            self._finish(run_id)
+        except Exception as error:
+            self._failure(error)
+            raise
+        finally:
+            if not self.run_ended:
+                self.publish(
+                    {"type": "run_end", "run_id": run_id, "status": "cancelled"}
+                )
+            self.busy = False

@@ -125,7 +125,7 @@ function _computeSubgraphLayout(
                 x: (nodeX.get(n.id) ?? pos.x) - w / 2 + SUBGRAPH_PADDING / 2,
                 y: (nodeY.get(n.id) ?? pos.y) - h / 2 + SUBGRAPH_HEADER_HEIGHT + SUBGRAPH_PADDING / 2,
             },
-            data: {label: n.name, nodeType: n.node_type as NodeData["nodeType"], status: "idle" as const, handles},
+            data: {label: n.label ?? n.name, role: n.role, description: n.description, nodeType: n.node_type as NodeData["nodeType"], status: "idle" as const, handles},
         };
         if (inner) node.style = {width: inner.width, height: inner.height};
         return node;
@@ -261,7 +261,7 @@ export function computeLayout(topology: GraphMessage, rankDir: RankDir = "TB"): 
                 x: (nodeX.get(n.id) ?? pos.x) - w / 2,
                 y: (nodeY.get(n.id) ?? pos.y) - h / 2,
             },
-            data: {label: n.name, nodeType: n.node_type, status: "idle" as const, handles},
+            data: {label: n.label ?? n.name, role: n.role, description: n.description, nodeType: n.node_type, status: "idle" as const, handles},
         };
         if (sg) node.style = {width: sg.width, height: sg.height};
         return node;

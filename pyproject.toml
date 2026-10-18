@@ -1,7 +1,7 @@
 [project]
 name = "langgraphics"
 version = "0.1.0-beta.4"
-description = "Debug LangGraph-based agents visually - live execution graph, node inspection, and run replay, all from a single line."
+description = "Debug LangGraph-based agents visually - live execution graph, interactive 3D paths and run replay, all from a single line."
 readme = { file = "README.md", content-type = "text/markdown" }
 license = "MIT"
 requires-python = ">=3.10"
@@ -23,11 +23,12 @@ classifiers = [
 ]
 dependencies = [
     "langchain-core>=1.0.0",
-    "langgraph>=1.0.0",
+    "langgraph>=1.2.0,<1.3",
     "websockets>=14.0",
 ]
 
 [dependency-groups]
+react = ["openai>=1.0.0", "python-dotenv>=1.0.0"]
 dev = [
     "deepagents>=0.3.3; python_version >= '3.11'",
     "langchain>=1.2.7",

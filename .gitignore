@@ -99,3 +99,10 @@ dist-ssr
 
 # Metadata sync
 langgraphics/metadata/.sync_time
+
+# Keep the 3D frontend build reproducible.
+!langgraphics-web/package-lock.json
+
+# Ship the built viewer for direct Git installs without Node.js.
+!langgraphics/static/
+!langgraphics/static/**

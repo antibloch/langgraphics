@@ -31,9 +31,18 @@ class Broadcaster:
         msg_type = json.loads(message).get("type")
         if msg_type == "run_start":
             self.replay = [message]
-        elif msg_type in ("run_end", "error"):
-            self.replay = []
-        elif msg_type in ("edge_active", "node_output", "node_step"):
+        elif msg_type in (
+            "run_end",
+            "error",
+            "edge_active",
+            "node_output",
+            "node_step",
+            "node_start",
+            "node_end",
+            "graph_edge",
+            "run_interrupt",
+            "task_attempt_error",
+        ):
             self.replay.append(message)
 
     async def broadcast(self, message: str) -> None:

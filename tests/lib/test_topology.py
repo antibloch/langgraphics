@@ -85,7 +85,9 @@ def test_basic_agent_node_types():
     assert types["__start__"] == "start"
     assert types["__end__"] == "end"
     assert types["summariser_runner"] == "node"
-    assert types["tools"] == "node"
+    assert types["tools"] == "subgraph"
+    tools = next(node for node in topo["nodes"] if node["id"] == "tools")
+    assert any(node.get("role") == "tool" for node in tools["subgraph"]["nodes"])
     assert types["responder"] == "node"
 
 
@@ -121,7 +123,10 @@ def test_sync_agent_node_types():
     assert types["__start__"] == "start"
     assert types["__end__"] == "end"
     for node in ("initial", "sync_a", "sync_b", "sync_c", "final"):
-        assert types[node] == "node"
+        assert types[node] in {"node", "subgraph"}
+        if types[node] == "subgraph":
+            tools = next(item for item in topo["nodes"] if item["id"] == node)
+            assert any(child.get("role") == "tool" for child in tools["subgraph"]["nodes"])
 
 
 def test_sync_agent_fan_out_edges():
@@ -164,7 +169,10 @@ def test_react_agent_node_types():
     assert types["__start__"] == "start"
     assert types["__end__"] == "end"
     for node in _REACT_NODES - {"__start__", "__end__"}:
-        assert types[node] == "node"
+        assert types[node] in {"node", "subgraph"}
+        if types[node] == "subgraph":
+            tools = next(item for item in topo["nodes"] if item["id"] == node)
+            assert any(child.get("role") == "tool" for child in tools["subgraph"]["nodes"])
 
 
 def test_react_agent_check_progress_has_four_conditional_edges():
@@ -210,7 +218,10 @@ def test_error_agent_node_types():
     assert types["__start__"] == "start"
     assert types["__end__"] == "end"
     for node in _ERROR_NODES - {"__start__", "__end__"}:
-        assert types[node] == "node"
+        assert types[node] in {"node", "subgraph"}
+        if types[node] == "subgraph":
+            tools = next(item for item in topo["nodes"] if item["id"] == node)
+            assert any(child.get("role") == "tool" for child in tools["subgraph"]["nodes"])
 
 
 def test_error_agent_check_progress_conditional_edges():
@@ -267,7 +278,10 @@ def test_deep_agent_node_types():
     assert types["__start__"] == "start"
     assert types["__end__"] == "end"
     for node in _deep_expected(topo)[0] - {"__start__", "__end__"}:
-        assert types[node] == "node"
+        assert types[node] in {"node", "subgraph"}
+        if types[node] == "subgraph":
+            tools = next(item for item in topo["nodes"] if item["id"] == node)
+            assert any(child.get("role") == "tool" for child in tools["subgraph"]["nodes"])
 
 
 @requires_deepagents
@@ -368,7 +382,9 @@ def test_sub2_agent_subgraph_node_type():
     assert types["subgraph"] == "subgraph"
     assert types["summariser_runner"] == "node"
     assert types["responder"] == "node"
-    assert types["tools"] == "node"
+    assert types["tools"] == "subgraph"
+    tools = next(node for node in topo["nodes"] if node["id"] == "tools")
+    assert any(node.get("role") == "tool" for node in tools["subgraph"]["nodes"])
 
 
 def test_sub2_agent_top_level_edges():

@@ -9,6 +9,8 @@ export function computeStatuses(events: ExecutionEvent[], subgraphContainers: Se
 } {
     const nodeStatuses = new Map<string, NodeStatus>();
     const edgeStatuses = new Map<string, EdgeStatus>();
+    const runningTasks = new Map<string, Set<string>>();
+    const runtimeMode = events.some(event => event.type === "run_start" && event.trace_source);
     const edgeInfo = new Map<string, {source: string; target: string}>();
 
     for (const event of events) {
@@ -16,6 +18,12 @@ export function computeStatuses(events: ExecutionEvent[], subgraphContainers: Se
             nodeStatuses.clear();
             edgeStatuses.clear();
             edgeInfo.clear();
+            runningTasks.clear();
+        } else if (event.type === "edge_active" && runtimeMode) {
+            edgeInfo.set(event.edge_id, {source: event.source, target: event.target});
+            edgeStatuses.set(event.edge_id, "traversed");
+            if (event.source.endsWith('__start__')) nodeStatuses.set(event.source, "completed");
+            if (event.target.endsWith('__end__')) nodeStatuses.set(event.target, "completed");
         } else if (event.type === "edge_active") {
             edgeInfo.set(event.edge_id, {source: event.source, target: event.target});
             if (nodeStatuses.get(event.source) === "active") {
@@ -45,9 +53,19 @@ export function computeStatuses(events: ExecutionEvent[], subgraphContainers: Se
                     nodeStatuses.set(`${event.target}:__start__`, "active");
                 }
             }
+        } else if (event.type === "node_start") {
+            const tasks = runningTasks.get(event.node) ?? new Set<string>();
+            tasks.add(event.task_id); runningTasks.set(event.node, tasks);
+            nodeStatuses.set(event.node, "active");
+        } else if (event.type === "node_output" && event.status === "error" && !event.parent_run_id) {
+            const tasks = runningTasks.get(event.node_id);
+            tasks?.delete(event.run_id);
+            nodeStatuses.set(event.node_id, tasks?.size ? "active" : "error");
         } else if (event.type === "node_output" && event.status === "ok") {
+            const tasks = runningTasks.get(event.node_id);
+            tasks?.delete(event.run_id);
             if (nodeStatuses.get(event.node_id) === "active") {
-                nodeStatuses.set(event.node_id, "completed");
+                nodeStatuses.set(event.node_id, tasks?.size ? "active" : "completed");
                 for (const [id, info] of edgeInfo) {
                     if (info.target === event.node_id && edgeStatuses.get(id) === "active") {
                         edgeStatuses.set(id, "traversed");
@@ -89,6 +107,7 @@ function collectSubgraphContainers(nodes: GraphMessage["nodes"], prefix: string,
 }
 
 export function useGraphState(topology: GraphMessage | null, events: ExecutionEvent[], rankDir: RankDir = "TB") {
+    const runtimeMode = events.some(event => event.type === "run_start" && event.trace_source);
     const base = useMemo(() => {
         if (!topology) return {nodes: [] as Node<NodeData>[], edges: [] as Edge<EdgeData>[]};
         return computeLayout(topology, rankDir);
@@ -116,7 +135,7 @@ export function useGraphState(topology: GraphMessage | null, events: ExecutionEv
 
         const activeNodeIds: string[] = [];
         const nodes = base.nodes.map((node) => {
-            const status = nodeStatuses.get(node.id) ?? (node.parentId ? resolveStatus(node.id) : undefined);
+            const status = nodeStatuses.get(node.id) ?? (!runtimeMode && node.parentId ? resolveStatus(node.id) : undefined);
             if (status === "active" && !node.parentId) activeNodeIds.push(node.id);
             return {...node, className: status};
         });
@@ -125,7 +144,7 @@ export function useGraphState(topology: GraphMessage | null, events: ExecutionEv
             const lastColon = edge.source.lastIndexOf(":");
             const parentId = lastColon !== -1 ? edge.source.slice(0, lastColon) : undefined;
             const rawStatus = edgeStatuses.get(edge.id)
-                ?? (parentId ? (() => {
+                ?? (!runtimeMode && parentId ? (() => {
                     const ps = nodeStatuses.get(parentId) ?? resolveStatus(parentId);
                     if (ps !== "completed") return undefined;
                     return "traversed";
@@ -149,5 +168,5 @@ export function useGraphState(topology: GraphMessage | null, events: ExecutionEv
         });
 
         return {nodes, edges, activeNodeIds};
-    }, [base, events, subgraphContainers]);
+    }, [base, events, subgraphContainers, runtimeMode]);
 }

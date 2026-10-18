@@ -1,113 +1,49 @@
-import {useCallback, useMemo, useState} from "react";
-import {createRoot} from "react-dom/client";
-import {type ColorMode} from "@xyflow/react";
-import {ReactFlowProvider} from "@xyflow/react";
-import {useWebSocket} from "./hooks/useWebSocket";
-import {useGraphState} from "./hooks/useGraphState";
-import {GraphCanvas} from "./components/GraphCanvas";
-import type {ExecutionEvent, ViewMode, InspectorMode} from "./types.ts";
-import type {RankDir} from "./layout";
-import "@xyflow/react/dist/style.css";
-import "./index.css";
+import {useEffect, useRef, useState} from 'react';
+import {createRoot} from 'react-dom/client';
+import type {ColorMode} from '@xyflow/react';
+import {useWebSocket} from './hooks/useWebSocket';
+import {useGraphState} from './hooks/useGraphState';
+import {GraphCanvas} from './components/GraphCanvas';
+import {eventTime} from './trace';
+import {PlaybackClock} from './playback';
+import type {RankDir} from './layout';
+import './index.css';
 
-function parseParams(): {theme: ColorMode; direction: RankDir, mode: ViewMode, inspect: InspectorMode, ws_url: string} {
-    const p = new URLSearchParams(window.location.search);
-    const mode = p.get("mode") ?? "auto";
-    const theme = p.get("theme") ?? "system";
-    const inspect = p.get("inspect") ?? "off";
-    const direction = p.get("direction") ?? "TB";
-    return {
-        inspect: (["off", "tree", "full"].includes(inspect) ? inspect : "off") as InspectorMode,
-        theme: (["system", "light", "dark"].includes(theme) ? theme : "system") as ColorMode,
-        direction: (["TB", "LR"].includes(direction) ? direction : "TB") as RankDir,
-        mode: (["auto", "manual"].includes(mode) ? mode : "auto") as ViewMode,
-        ws_url: "ws://localhost:" + (p.get("ws_port") ?? "8765"),
-    };
-}
-
-const {theme, mode, inspect, direction, ws_url} = parseParams();
+const params = new URLSearchParams(window.location.search);
+const theme: ColorMode = params.get('theme') === 'light' ? 'light' : 'dark';
+const direction: RankDir = params.get('direction') === 'LR' ? 'LR' : 'TB';
+const wsURL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.hostname}:${params.get('ws_port') ?? '8765'}`;
 
 function Index() {
-    const [rankDir, setRankDir] = useState<RankDir>(direction);
-    const {topology, events, nodeEntries} = useWebSocket(ws_url);
-    const [displayEvents, setDisplayEvents] = useState<ExecutionEvent[]>([]);
-    const [displayNodeEntries, setDisplayNodeEntries] = useState<typeof nodeEntries>([]);
-
-    const playEvents = useMemo(() => {
-        return displayEvents.length > 0 ? displayEvents : events;
-    }, [displayEvents, events]);
-
-    const playNodeEntries = useMemo(() => {
-        return displayEvents.length > 0 ? displayNodeEntries : nodeEntries;
-    }, [displayEvents, displayNodeEntries, nodeEntries]);
-
-    const isRecording = useMemo(() => {
-        return !events.find(({type}) => ["error", "run_end"].includes(type));
-    }, [events]);
-
-    const isReplaying = useMemo(() => {
-        return !isRecording && displayEvents.length > 0 &&
-            !displayEvents.find(({type}) => ["error", "run_end"].includes(type));
-    }, [isRecording, displayEvents]);
-
-    const {nodes, edges, activeNodeIds} = useGraphState(topology, playEvents, rankDir);
-
-    const startReplay = useCallback(async () => {
-        setDisplayEvents([]);
-        setDisplayNodeEntries([]);
-        let parentIndex = 0;
-
-        const batches: ExecutionEvent[][] = [];
-        const pending: ExecutionEvent[] = [];
-        for (const event of events) {
-            if (event.type === "node_output") { pending.push(event); continue; }
-            if (event.type === "run_start") pending.length = 0;
-            const last = batches[batches.length - 1];
-            const prev = last?.[last.length - 1];
-            if (last &&
-                prev?.type === "edge_active" &&
-                event.type === "edge_active" &&
-                ((event as any).source === (prev as any).source ||
-                 (event as any).target === (prev as any).target)) last.push(...pending, event);
-            else batches.push([...pending, event]);
-            pending.length = 0;
-        }
-        if (pending.length > 0 && batches.length > 0) batches[batches.length - 1].push(...pending);
-
-        for (const batch of batches) {
-            for (const event of batch) {
-                parentIndex = Math.max(parentIndex, nodeEntries.findIndex(
-                    ({node_id}) => node_id === (event as any).source
-                ));
-            }
-            setDisplayEvents(prev => [...prev, ...batch]);
-            setDisplayNodeEntries(nodeEntries.slice(0, parentIndex + 1));
-            await new Promise<void>(r => setTimeout(r, 1500));
-        }
-
-        setDisplayEvents([]);
-        setDisplayNodeEntries([]);
-    }, [events, nodeEntries]);
-
-    return (
-        <ReactFlowProvider>
-            <GraphCanvas
-                nodes={nodes}
-                edges={edges}
-                initialMode={mode}
-                events={playEvents}
-                onReplay={startReplay}
-                initialInspect={inspect}
-                initialColorMode={theme}
-                isRecording={isRecording}
-                isReplaying={isReplaying}
-                initialRankDir={direction}
-                onRankDirChange={setRankDir}
-                nodeEntries={playNodeEntries}
-                activeNodeIds={activeNodeIds}
-            />
-        </ReactFlowProvider>
-    );
+    const {topology, events} = useWebSocket(wsURL);
+    const [clockMs, setClockMs] = useState(0);
+    const [isPlaying, setIsPlaying] = useState(true);
+    const clock = useRef(new PlaybackClock());
+    const recorded = useRef(events);
+    recorded.current = events;
+    const runId = events.find(event => event.type === 'run_start')?.run_id;
+    useEffect(() => {
+        clock.current = new PlaybackClock(); setClockMs(0); setIsPlaying(true);
+    }, [runId]);
+    useEffect(() => {
+        let frame: number;
+        const animate = (now: number) => {
+            setClockMs(clock.current.tick(now, recorded.current));
+            setIsPlaying(clock.current.playing);
+            frame = requestAnimationFrame(animate);
+        };
+        frame = requestAnimationFrame(animate);
+        return () => cancelAnimationFrame(frame);
+    }, []);
+    const displayEvents = events.filter(event => eventTime(event) <= clockMs);
+    const {nodes, edges} = useGraphState(topology, displayEvents, direction);
+    const togglePlayback = () => {
+        clock.current.toggle(performance.now(), events);
+        setClockMs(clock.current.position); setIsPlaying(clock.current.playing);
+    };
+    return <GraphCanvas nodes={nodes} edges={edges} events={displayEvents}
+        onTogglePlayback={togglePlayback} initialColorMode={theme}
+        isPlaying={isPlaying} clockMs={clockMs} initialRankDir={direction}/>;
 }
 
-createRoot(document.getElementById("root")!).render(<Index/>);
+createRoot(document.getElementById('root')!).render(<Index/>);

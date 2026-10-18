@@ -44,6 +44,13 @@ export function useWebSocket(url: string) {
                         setEvents([]);
                         setTopology(msg);
                         setNodeEntries([]);
+                    } else if (msg.type === "graph_edge") {
+                        setTopology(prev => {
+                            if (!prev || prev.edges.some(edge => edge.id === msg.id)) return prev;
+                            // Runtime routes have stable full node IDs; flattened
+                            // connections may link nodes across nested scopes.
+                            return {...prev, edges: [...prev.edges, msg]};
+                        });
                     } else if (msg.type === "run_start") {
                         runDone = false;
                         setEvents([msg]);
@@ -51,7 +58,7 @@ export function useWebSocket(url: string) {
                     } else if (msg.type === "node_output") {
                         const {type: _, ...entry} = msg;
                         setNodeEntries((prev) => [...prev, entry]);
-                        if (msg.status === "ok" && !msg.parent_run_id) {
+                        if (!msg.parent_run_id) {
                             setEvents((prev) => [...prev, msg]);
                         }
                     } else {
