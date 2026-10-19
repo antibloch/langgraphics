@@ -9,6 +9,21 @@ Agent abstractions can be ReAct, planner, reflector, executor, or your own nodes
 Internal `ToolNode` dispatch plumbing is hidden. A glowing red dot appears when
 a tool produces an output, without an output popup or text label.
 
+## Demo: same agent, different prompts
+
+The same ReAct agent has access to `check_news` and `check_weather`. On the
+left, **“latest news on AI”** activates `check_news`; on the right,
+**“check the weather in Lahore”** activates `check_weather`. Both tools make
+live requests, and the animation follows the recorded execution events.
+
+https://github.com/user-attachments/assets/8bef5b57-62fa-4045-bd60-3571195d3b1a
+
+The prompt cards are separate from the 3D views. Both recordings retain their
+original playback speed; the shorter news recording holds its final frame
+until the weather recording finishes.
+
+Run it yourself with the [news and weather example](#live-news-and-weather-react-example).
+
 ## Install
 
 Requires Python 3.10+, Git, and a browser with WebGL. The supported LangGraph
