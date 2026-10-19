@@ -153,6 +153,26 @@ All catalog and shipping facts in these examples are local demonstration data.
 `--no-open-browser`, `--port`, and `--ws-port` are available on both examples.
 Stop their server with Ctrl+C when finished.
 
+## Live news and weather ReAct example
+
+This agent has `check_news` (Google News RSS headlines) and `check_weather`
+(Open-Meteo current weather). Both use real HTTP requests without extra API keys.
+It uses the same IFM model configuration as the other ReAct examples.
+
+```bash
+uv run --group react python examples/news_weather_react_ifm.py \
+  --env-file ../practice_agent/.env \
+  --prompt "check latest news on AI"
+```
+
+Open `http://localhost:8804/?ws_port=8805&theme=dark`. The agent chooses which
+available tools to call; this prompt normally calls only `check_news`. Try
+`--prompt "check the weather in Lahore"` to activate only `check_weather`, or
+`--prompt "Check the weather in London and latest news on AI"` to exercise both.
+News results are RSS headlines and links, not verified full article summaries.
+Use **Resume** after completion to replay the actual execution timestamps.
+Optional `--trace-file /tmp/news-weather-trace.json` saves the recording.
+
 ## Replay without a model or API key
 
 A recorded real three-tool execution is included:

@@ -13,10 +13,10 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from complex_react_ifm import (
-    ActionDecision,
     calculator,
     convert_units,
     lookup_product,
@@ -29,6 +29,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from openai import AsyncOpenAI
+from pydantic import BaseModel, ConfigDict
 
 from langgraphics import watch
 
@@ -42,15 +43,27 @@ DEFAULT_PROMPT = (
 )
 
 
+class ToolCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    arguments_json: str
+
+
+class Decision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["tools", "finish"]
+    calls: list[ToolCall]
+    answer: str
+
+
 class State(MessagesState):
     steps: int
 
 
-def build_agent(client, model):
-    schema = ActionDecision.model_json_schema()
-    schema["$defs"]["ActionCall"]["properties"]["name"]["enum"] = [
-        t.name for t in TOOLS
-    ]
+def build_agent(client, model, tools=None):
+    tools = TOOLS if tools is None else tools
+    schema = Decision.model_json_schema()
+    schema["$defs"]["ToolCall"]["properties"]["name"]["enum"] = [t.name for t in tools]
 
     async def agent(state):
         if state.get("steps", 0) >= 6:
@@ -69,7 +82,7 @@ def build_agent(client, model):
                         "([{name, arguments_json}]), answer (string). arguments_json must be "
                         "a JSON-encoded argument object. For tools leave answer empty; for "
                         "finish use an empty calls list. Only these tools exist: "
-                        + json.dumps([convert_to_openai_tool(t) for t in TOOLS])
+                        + json.dumps([convert_to_openai_tool(t) for t in tools])
                     ),
                 },
                 {
@@ -89,14 +102,16 @@ def build_agent(client, model):
             max_tokens=16384,
             extra_body={"chat_template_kwargs": {"reasoning_effort": "low"}},
         )
-        decision = parse_action(response.choices[0].message.content or "")
+        decision = parse_action(
+            response.choices[0].message.content or "", Decision, ToolCall
+        )
         if (decision.action == "tools") != bool(decision.calls):
             raise ValueError("Tool actions require calls; finish requires no calls")
         if len(decision.calls) > 1:
             raise ValueError("This minimal demo executes one tool per model turn")
         calls = []
         for call in decision.calls:
-            if call.name not in {t.name for t in TOOLS}:
+            if call.name not in {t.name for t in tools}:
                 raise ValueError(f"Tool is not registered: {call.name}")
             calls.append(
                 {
@@ -126,7 +141,7 @@ def build_agent(client, model):
     )
     builder.add_node(
         "tools",
-        ToolNode(TOOLS, handle_tool_errors=True),
+        ToolNode(tools, handle_tool_errors=True),
         metadata={
             "langgraphics_role": "executor",
             "langgraphics_label": "Tool executor",

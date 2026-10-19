@@ -198,7 +198,7 @@ class ActionDecision(BaseModel):
     answer: str
 
 
-def parse_action(content):
+def parse_action(content, decision_type=ActionDecision, call_type=ActionCall):
     for marker in ("</ifm|think>", "</think>"):
         if marker in content:
             content = content.rsplit(marker, 1)[-1]
@@ -212,17 +212,17 @@ def parse_action(content):
         except (ValueError, TypeError):
             continue
         try:
-            return ActionDecision.model_validate(value)
+            return decision_type.model_validate(value)
         except (ValueError, TypeError):
             pass
         try:
-            calls.append(ActionCall.model_validate(value))
+            calls.append(call_type.model_validate(value))
         except (ValueError, TypeError):
             pass
     if calls:
         # IFM may return one JSON call per line instead of an enclosing object.
         # Preserve only the calls it actually emitted, in their original order.
-        return ActionDecision(action="tools", calls=calls, answer="")
+        return decision_type(action="tools", calls=calls, answer="")
     raise ValueError("No executable action JSON")
 
 
